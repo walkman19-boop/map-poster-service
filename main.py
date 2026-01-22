@@ -12,17 +12,16 @@ GCS_PREFIX = os.environ.get("GCS_PREFIX", "renders")
 
 
 def upload_to_gcs(data: bytes, content_type: str, filename: str) -> str:
-    if not OUTPUT_BUCKET:
-        raise RuntimeError("OUTPUT_BUCKET env is not set")
-
+    bucket_name = os.environ["OUTPUT_BUCKET"]
     client = storage.Client()
-    bucket = client.bucket(OUTPUT_BUCKET)
-    blob = bucket.blob(f"{GCS_PREFIX}/{filename}")
+    bucket = client.bucket(bucket_name)
+
+    blob = bucket.blob(filename)
     blob.upload_from_string(data, content_type=content_type)
 
-    # Signed URL (1 hour) - simple for MVP
-    url = blob.generate_signed_url(expiration=3600, method="GET")
-    return url
+    blob.make_public()
+    return blob.public_url
+
 
 
 @app.get("/health")
