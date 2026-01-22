@@ -1,5 +1,3 @@
 flask
-gunicorn
-google-cloud-storage
-Pillow
 requests
+pillow
