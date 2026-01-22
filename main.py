@@ -1,273 +1,242 @@
 import os
-import re
-import io
-import json
-import uuid
-from datetime import timedelta
+import math
+import time
+from io import BytesIO
+from typing import Optional, Tuple
 
 import requests
-from flask import Flask, request, jsonify
-
+from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw, ImageFont
-from google.cloud import storage
 
 app = Flask(__name__)
 
+# ---------- Config ----------
+USER_AGENT = os.environ.get("USER_AGENT", "map-poster-service/1.0 (contact: you@domain.com)")
+DEFAULT_SIZE = int(os.environ.get("DEFAULT_SIZE", "2048"))  # output px (square)
+DEFAULT_THEME = os.environ.get("DEFAULT_THEME", "dark")     # dark | neon | light
+DEFAULT_ZOOM = int(os.environ.get("DEFAULT_ZOOM", "12"))    # OSM tile zoom 0..19
 
-# ----------------------------
-# Helpers: config / parsing
-# ----------------------------
+# Uses OSM static map endpoint for MVP testing.
+# For production: use a paid provider (MapTiler/Mapbox/Stadia/etc.) or your own tiles.
+STATIC_MAP_URL = os.environ.get("STATIC_MAP_URL", "https://staticmap.openstreetmap.de/staticmap.php")
 
-def getenv_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def get_gmaps_key() -> str:
-    # support both names (you previously had MAPS_API_KEY)
-    key = os.getenv("GMAPS_API_KEY") or os.getenv("MAPS_API_KEY")
-    if not key:
-        raise RuntimeError("Missing GMAPS_API_KEY env var")
-    return key
+# Optional font path (put font file into repo and set env FONT_PATH)
+FONT_PATH = os.environ.get("FONT_PATH", "")
 
 
-def parse_google_maps_link(maps_link: str):
-    """
-    Supports common formats, including:
-      https://www.google.com/maps/@54.707849,25.3968932,16z
-    Returns: (lat: float, lng: float, zoom: int|None)
-    """
-    if not maps_link or not isinstance(maps_link, str):
-        raise ValueError("maps_link is required and must be a string")
-
-    # Try @lat,lng,zoomz
-    m = re.search(r"/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)z", maps_link)
-    if m:
-        lat = float(m.group(1))
-        lng = float(m.group(2))
-        zoom = int(float(m.group(3)))
-        return lat, lng, zoom
-
-    # Try query param q=lat,lng or ll=lat,lng (fallback, zoom unknown)
-    m = re.search(r"[?&](?:q|ll)=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", maps_link)
-    if m:
-        lat = float(m.group(1))
-        lng = float(m.group(2))
-        return lat, lng, None
-
-    raise ValueError("Could not parse lat/lng/zoom from maps_link. Expected /@lat,lng,zoomz format.")
-
-
-# ----------------------------
-# Google Static Maps
-# ----------------------------
-
-def fetch_static_map(lat: float, lng: float, zoom: int, size_px=(1200, 1200), scale: int = 2, maptype: str = "roadmap") -> bytes:
-    """
-    Fetches PNG bytes from Google Static Maps API.
-    Note: max 'size' for static maps is 640x640 (free), but with scale=2 you get higher resolution.
-    We'll request within limits: size <= 640x640, scale=2 gives up to 1280px effective.
-    """
-    key = get_gmaps_key()
-
-    # Google Static Maps limit: size param max 640x640
-    # We'll clamp requested size to 640 while keeping output quality with scale=2.
-    req_w = min(640, max(1, int(size_px[0] // scale)))
-    req_h = min(640, max(1, int(size_px[1] // scale)))
-
-    params = {
-        "center": f"{lat},{lng}",
-        "zoom": str(int(zoom)),
-        "size": f"{req_w}x{req_h}",
-        "scale": str(int(scale)),
-        "maptype": maptype,
-        "format": "png",
-        "key": key,
-    }
-
-    url = "https://maps.googleapis.com/maps/api/staticmap"
-    r = requests.get(url, params=params, timeout=30)
-    # If billing/API disabled or restrictions wrong, you'll see 403/400 here.
-    r.raise_for_status()
-    return r.content
-
-
-# ----------------------------
-# Poster rendering
-# ----------------------------
-
-def load_font(size: int) -> ImageFont.FreeTypeFont:
-    """
-    Tries a few common fonts; falls back to default.
-    """
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-    for p in candidates:
-        try:
-            return ImageFont.truetype(p, size=size)
-        except Exception:
-            continue
+# ---------- Helpers ----------
+def _load_font(size: int) -> ImageFont.ImageFont:
+    if FONT_PATH and os.path.exists(FONT_PATH):
+        return ImageFont.truetype(FONT_PATH, size=size)
+    # fallback
     return ImageFont.load_default()
 
 
-def render_poster_png(map_png_bytes: bytes, title: str = "", subtitle: str = "", out_size=(1200, 1200)) -> bytes:
-    """
-    Makes a simple poster:
-      - map as background (center-cropped to out_size)
-      - translucent panel bottom
-      - title/subtitle text
-    """
-    img = Image.open(io.BytesIO(map_png_bytes)).convert("RGBA")
+def geocode_nominatim(address: str) -> Tuple[float, float]:
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": address, "format": "json", "limit": 1},
+        headers={"User-Agent": USER_AGENT},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise ValueError("Address not found")
+    return float(data[0]["lat"]), float(data[0]["lon"])
 
-    # center-crop to out_size
-    target_w, target_h = out_size
-    # Resize up if needed
-    if img.width < target_w or img.height < target_h:
-        scale = max(target_w / img.width, target_h / img.height)
-        new_w = int(img.width * scale)
-        new_h = int(img.height * scale)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
 
-    left = (img.width - target_w) // 2
-    top = (img.height - target_h) // 2
-    img = img.crop((left, top, left + target_w, top + target_h))
+def fetch_static_map(lat: float, lon: float, zoom: int, size_px: int) -> Image.Image:
+    # staticmap.openstreetmap.de expects width/height <= ~2048. We'll clamp.
+    w = max(256, min(size_px, 2048))
+    h = max(256, min(size_px, 2048))
 
-    draw = ImageDraw.Draw(img, "RGBA")
+    r = requests.get(
+        STATIC_MAP_URL,
+        params={
+            "center": f"{lat},{lon}",
+            "zoom": str(zoom),
+            "size": f"{w}x{h}",
+            "maptype": "mapnik",
+            # no marker by default
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=30,
+    )
+    r.raise_for_status()
+    img = Image.open(BytesIO(r.content)).convert("RGBA")
+    # upscale to requested size (for poster composition) if needed
+    if (w, h) != (size_px, size_px):
+        img = img.resize((size_px, size_px), Image.LANCZOS)
+    return img
 
-    # Bottom overlay
-    panel_h = int(target_h * 0.18)
-    panel_y0 = target_h - panel_h
-    draw.rectangle([(0, panel_y0), (target_w, target_h)], fill=(255, 255, 255, 200))
 
-    # Text
-    title = (title or "").strip()
+def apply_theme(map_img: Image.Image, theme: str) -> Image.Image:
+    theme = (theme or "").lower().strip()
+    if theme not in ("dark", "neon", "light"):
+        theme = DEFAULT_THEME
+
+    img = map_img.copy()
+
+    if theme == "light":
+        # very light touch
+        return img
+
+    # dark / neon: darken background & boost contrast
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 130 if theme == "dark" else 160))
+    img = Image.alpha_composite(img, overlay)
+
+    if theme == "neon":
+        # add subtle color shift to mimic neon vibe
+        r, g, b, a = img.split()
+        # boost blues/pinks slightly
+        g = g.point(lambda x: min(255, int(x * 0.95)))
+        b = b.point(lambda x: min(255, int(x * 1.10)))
+        img = Image.merge("RGBA", (r, g, b, a))
+
+    return img
+
+
+def format_coords(lat: float, lon: float) -> str:
+    # simple, readable
+    return f"{lat:.5f}, {lon:.5f}"
+
+
+def compose_poster(
+    lat: float,
+    lon: float,
+    zoom: int,
+    title: str,
+    subtitle: str,
+    theme: str,
+    size_px: int,
+) -> Image.Image:
+    # Poster canvas: map square + bottom text band
+    band_h = int(size_px * 0.20)
+    canvas = Image.new("RGBA", (size_px, size_px + band_h), (10, 10, 10, 255) if theme in ("dark", "neon") else (250, 250, 250, 255))
+
+    # map
+    map_img = fetch_static_map(lat, lon, zoom, size_px)
+    map_img = apply_theme(map_img, theme)
+    canvas.paste(map_img, (0, 0), map_img)
+
+    # text band
+    draw = ImageDraw.Draw(canvas)
+    band_y0 = size_px
+
+    if theme == "light":
+        band_color = (250, 250, 250, 255)
+        text_color = (20, 20, 20, 255)
+        sub_color = (80, 80, 80, 255)
+    else:
+        band_color = (8, 8, 10, 255) if theme == "dark" else (6, 6, 12, 255)
+        text_color = (235, 235, 240, 255)
+        sub_color = (170, 170, 180, 255)
+
+    draw.rectangle([0, band_y0, size_px, size_px + band_h], fill=band_color)
+
+    # fonts
+    title_font = _load_font(int(band_h * 0.36))
+    sub_font = _load_font(int(band_h * 0.18))
+    coord_font = _load_font(int(band_h * 0.16))
+
+    # text
+    title = (title or "").strip() or "YOUR PLACE"
     subtitle = (subtitle or "").strip()
 
-    title_font = load_font(64)
-    subtitle_font = load_font(36)
+    x_pad = int(size_px * 0.06)
+    y = band_y0 + int(band_h * 0.18)
 
-    padding_x = 60
-    y = panel_y0 + 25
-
-    if title:
-        draw.text((padding_x, y), title, fill=(0, 0, 0, 255), font=title_font)
-        y += 70
+    draw.text((x_pad, y), title.upper(), font=title_font, fill=text_color)
+    y += int(band_h * 0.42)
 
     if subtitle:
-        draw.text((padding_x, y), subtitle, fill=(40, 40, 40, 255), font=subtitle_font)
+        draw.text((x_pad, y), subtitle.upper(), font=sub_font, fill=sub_color)
+        y += int(band_h * 0.22)
 
-    out = io.BytesIO()
-    img.convert("RGB").save(out, format="PNG", optimize=True)
-    return out.getvalue()
+    coords = format_coords(lat, lon)
+    draw.text((x_pad, band_y0 + band_h - int(band_h * 0.28)), coords, font=coord_font, fill=sub_color)
 
-
-def png_to_pdf_bytes(png_bytes: bytes) -> bytes:
-    """
-    Simple 1-page PDF with the PNG filling the page.
-    Uses reportlab (installed).
-    """
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.utils import ImageReader
-
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    w, h = img.size
-
-    out = io.BytesIO()
-    c = canvas.Canvas(out, pagesize=(w, h))
-    c.drawImage(ImageReader(img), 0, 0, width=w, height=h)
-    c.showPage()
-    c.save()
-    return out.getvalue()
+    return canvas.convert("RGB")
 
 
-# ----------------------------
-# GCS upload + signed URL
-# ----------------------------
+def parse_payload(payload: dict) -> Tuple[float, float, int, str, str, str, int]:
+    # Accept:
+    # - lat/lng (or lon)
+    # - address
+    # - zoom (tile zoom 0..19)
+    # - theme
+    # - size
+    lat = payload.get("lat")
+    lng = payload.get("lng")
+    lon = payload.get("lon")
+    address = payload.get("address")
 
-def upload_to_gcs(data: bytes, content_type: str, object_name: str) -> str:
-    bucket_name = os.getenv("OUTPUT_BUCKET")
-    if not bucket_name:
-        raise RuntimeError("Missing OUTPUT_BUCKET env var")
+    zoom = payload.get("zoom", DEFAULT_ZOOM)
+    theme = payload.get("theme", DEFAULT_THEME)
+    size_px = int(payload.get("size", DEFAULT_SIZE))
 
-    prefix = (os.getenv("GCS_PREFIX") or "").strip().strip("/")
-    if prefix:
-        object_name = f"{prefix}/{object_name}"
+    title = payload.get("title", "")
+    subtitle = payload.get("subtitle", "")
 
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(object_name)
+    if lat is not None and (lng is not None or lon is not None):
+        lat = float(lat)
+        lng = float(lng if lng is not None else lon)
+    elif address:
+        lat, lng = geocode_nominatim(str(address))
+        # be friendly to Nominatim
+        time.sleep(1.0)
+    else:
+        raise ValueError("Provide either (lat + lng) OR address")
 
-    blob.upload_from_string(data, content_type=content_type)
+    # zoom clamp
+    try:
+        zoom = int(float(zoom))
+    except Exception:
+        zoom = DEFAULT_ZOOM
+    zoom = max(0, min(19, zoom))
 
-    sign_urls = getenv_bool("SIGN_URLS", False)
-    if sign_urls:
-        # requires roles/iam.serviceAccountTokenCreator on the service account
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=30),
-            method="GET",
-        )
+    # size clamp (Render memory)
+    size_px = max(512, min(size_px, 4096))
 
-    # Not public; returns gs:// URL as an internal reference
-    return f"gs://{bucket_name}/{object_name}"
+    return lat, lng, zoom, str(title), str(subtitle), str(theme), size_px
 
 
-# ----------------------------
-# Routes
-# ----------------------------
-
+# ---------- Routes ----------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
-
+    return "ok"
 
 @app.post("/render")
 def render():
-    """
-    JSON body example:
-    {
-      "maps_link": "https://www.google.com/maps/@54.707849,25.3968932,16z",
-      "zoom": 16,
-      "output": "PNG",
-      "title": "Pupojai",
-      "subtitle": "Vilnius"
-    }
-    """
     payload = request.get_json(silent=True) or {}
+    try:
+        lat, lng, zoom, title, subtitle, theme, size_px = parse_payload(payload)
+        img = compose_poster(
+            lat=lat,
+            lon=lng,
+            zoom=zoom,
+            title=title,
+            subtitle=subtitle,
+            theme=theme,
+            size_px=size_px,
+        )
 
-    maps_link = payload.get("maps_link", "")
-    title = payload.get("title", "")
-    subtitle = payload.get("subtitle", "")
-    output = (payload.get("output") or "PNG").strip().upper()
+        out = BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        out.seek(0)
 
-    # zoom: from JSON or from link
-    zoom_in = payload.get("zoom")
-    lat, lng, zoom_from_link = parse_google_maps_link(maps_link)
-    zoom = int(zoom_in) if zoom_in is not None else (zoom_from_link if zoom_from_link is not None else 16)
-
-    # Fetch map and render
-    map_png = fetch_static_map(lat, lng, zoom, size_px=(1200, 1200), scale=2, maptype="roadmap")
-    poster_png = render_poster_png(map_png, title=title, subtitle=subtitle, out_size=(1200, 1200))
-
-    filename_base = uuid.uuid4().hex
-
-    if output == "PNG":
-        url = upload_to_gcs(poster_png, "image/png", f"{filename_base}.png")
-        return jsonify({"ok": True, "output": "PNG", "url": url})
-
-    if output == "PDF":
-        pdf_bytes = png_to_pdf_bytes(poster_png)
-        url = upload_to_gcs(pdf_bytes, "application/pdf", f"{filename_base}.pdf")
-        return jsonify({"ok": True, "output": "PDF", "url": url})
-
-    return jsonify({"ok": False, "error": "Invalid output. Use PNG or PDF."}), 400
+        filename = (title.strip() or "poster").replace(" ", "_")[:40]
+        return send_file(
+            out,
+            mimetype="image/png",
+            as_attachment=True,
+            download_name=f"{filename}.png",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
-# For local dev
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
