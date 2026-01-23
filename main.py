@@ -1,34 +1,34 @@
 import os
-import math
 import time
 from io import BytesIO
-from typing import Optional, Tuple
+from typing import Tuple
 
 import requests
 from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw, ImageFont
 
+# -------- Version (so you can confirm Render is running this exact file) --------
+VERSION = "maptiler-full-1"
+
 app = Flask(__name__)
 
-# ---------- Config ----------
+# -------- Config / Env --------
 USER_AGENT = os.environ.get("USER_AGENT", "map-poster-service/1.0 (contact: you@domain.com)")
-DEFAULT_SIZE = int(os.environ.get("DEFAULT_SIZE", "2048"))  # output px (square)
-DEFAULT_THEME = os.environ.get("DEFAULT_THEME", "dark")     # dark | neon | light
-DEFAULT_ZOOM = int(os.environ.get("DEFAULT_ZOOM", "12"))    # OSM tile zoom 0..19
 
-# Uses OSM static map endpoint for MVP testing.
-# For production: use a paid provider (MapTiler/Mapbox/Stadia/etc.) or your own tiles.
-STATIC_MAP_URL = os.environ.get("STATIC_MAP_URL", "https://staticmap.openstreetmap.de/staticmap.php")
+MAPTILER_KEY = os.environ.get("MAPTILER_KEY", "")
+MAPTILER_MAP_ID = os.environ.get("MAPTILER_MAP_ID", "streets-v2")
 
-# Optional font path (put font file into repo and set env FONT_PATH)
-FONT_PATH = os.environ.get("FONT_PATH", "")
+DEFAULT_ZOOM = int(os.environ.get("DEFAULT_ZOOM", "12"))      # 0..20 typical
+DEFAULT_SIZE = int(os.environ.get("DEFAULT_SIZE", "1024"))    # output map square px (512..4096)
+DEFAULT_THEME = os.environ.get("DEFAULT_THEME", "neon")       # neon | dark | light
+
+FONT_PATH = os.environ.get("FONT_PATH", "")  # optional: put a .ttf into repo and set env
 
 
-# ---------- Helpers ----------
+# -------- Helpers --------
 def _load_font(size: int) -> ImageFont.ImageFont:
     if FONT_PATH and os.path.exists(FONT_PATH):
         return ImageFont.truetype(FONT_PATH, size=size)
-    # fallback
     return ImageFont.load_default()
 
 
@@ -46,50 +46,51 @@ def geocode_nominatim(address: str) -> Tuple[float, float]:
     return float(data[0]["lat"]), float(data[0]["lon"])
 
 
-def fetch_static_map(lat: float, lon: float, zoom: int, size_px: int) -> Image.Image:
-    # staticmap.openstreetmap.de expects width/height <= ~2048. We'll clamp.
+def fetch_map_maptiler(lat: float, lon: float, zoom: int, size_px: int) -> Image.Image:
+    if not MAPTILER_KEY:
+        raise ValueError("Missing MAPTILER_KEY (set it in Render Environment Variables)")
+
+    # keep memory reasonable on free instances
+    size_px = max(512, min(int(size_px), 4096))
+    zoom = max(0, min(int(zoom), 20))
+
+    # MapTiler endpoint: /maps/{mapId}/static/{lon},{lat},{zoom}/{width}x{height}@2x.png?key=...
+    # Use @2x then downscale -> nicer lines.
     w = max(256, min(size_px, 2048))
     h = max(256, min(size_px, 2048))
 
+    url = f"https://api.maptiler.com/maps/{MAPTILER_MAP_ID}/static/{lon},{lat},{zoom}/{w}x{h}@2x.png"
     r = requests.get(
-        STATIC_MAP_URL,
-        params={
-            "center": f"{lat},{lon}",
-            "zoom": str(zoom),
-            "size": f"{w}x{h}",
-            "maptype": "mapnik",
-            # no marker by default
-        },
+        url,
+        params={"key": MAPTILER_KEY, "attribution": "false"},
         headers={"User-Agent": USER_AGENT},
         timeout=30,
     )
     r.raise_for_status()
+
     img = Image.open(BytesIO(r.content)).convert("RGBA")
-    # upscale to requested size (for poster composition) if needed
-    if (w, h) != (size_px, size_px):
-        img = img.resize((size_px, size_px), Image.LANCZOS)
+    img = img.resize((size_px, size_px), Image.LANCZOS)
     return img
 
 
 def apply_theme(map_img: Image.Image, theme: str) -> Image.Image:
     theme = (theme or "").lower().strip()
-    if theme not in ("dark", "neon", "light"):
+    if theme not in ("neon", "dark", "light"):
         theme = DEFAULT_THEME
 
     img = map_img.copy()
 
     if theme == "light":
-        # very light touch
         return img
 
-    # dark / neon: darken background & boost contrast
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 130 if theme == "dark" else 160))
+    # darken overlay
+    alpha = 140 if theme == "dark" else 165
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, alpha))
     img = Image.alpha_composite(img, overlay)
 
     if theme == "neon":
-        # add subtle color shift to mimic neon vibe
         r, g, b, a = img.split()
-        # boost blues/pinks slightly
+        # subtle neon-ish push
         g = g.point(lambda x: min(255, int(x * 0.95)))
         b = b.point(lambda x: min(255, int(x * 1.10)))
         img = Image.merge("RGBA", (r, g, b, a))
@@ -97,142 +98,124 @@ def apply_theme(map_img: Image.Image, theme: str) -> Image.Image:
     return img
 
 
-def format_coords(lat: float, lon: float) -> str:
-    # simple, readable
-    return f"{lat:.5f}, {lon:.5f}"
-
-
 def compose_poster(
-    lat: float,
-    lon: float,
-    zoom: int,
+    map_img: Image.Image,
     title: str,
     subtitle: str,
+    lat: float,
+    lon: float,
     theme: str,
-    size_px: int,
 ) -> Image.Image:
-    # Poster canvas: map square + bottom text band
+    size_px = map_img.size[0]
     band_h = int(size_px * 0.20)
-    canvas = Image.new("RGBA", (size_px, size_px + band_h), (10, 10, 10, 255) if theme in ("dark", "neon") else (250, 250, 250, 255))
 
-    # map
-    map_img = fetch_static_map(lat, lon, zoom, size_px)
-    map_img = apply_theme(map_img, theme)
-    canvas.paste(map_img, (0, 0), map_img)
-
-    # text band
-    draw = ImageDraw.Draw(canvas)
-    band_y0 = size_px
+    theme = (theme or "").lower().strip()
+    if theme not in ("neon", "dark", "light"):
+        theme = DEFAULT_THEME
 
     if theme == "light":
         band_color = (250, 250, 250, 255)
         text_color = (20, 20, 20, 255)
         sub_color = (80, 80, 80, 255)
     else:
-        band_color = (8, 8, 10, 255) if theme == "dark" else (6, 6, 12, 255)
+        band_color = (8, 8, 10, 255)
         text_color = (235, 235, 240, 255)
         sub_color = (170, 170, 180, 255)
 
-    draw.rectangle([0, band_y0, size_px, size_px + band_h], fill=band_color)
+    canvas = Image.new("RGBA", (size_px, size_px + band_h), band_color)
+    canvas.paste(map_img, (0, 0), map_img)
 
-    # fonts
-    title_font = _load_font(int(band_h * 0.36))
-    sub_font = _load_font(int(band_h * 0.18))
-    coord_font = _load_font(int(band_h * 0.16))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, size_px, size_px, size_px + band_h], fill=band_color)
 
     # text
     title = (title or "").strip() or "YOUR PLACE"
     subtitle = (subtitle or "").strip()
 
     x_pad = int(size_px * 0.06)
-    y = band_y0 + int(band_h * 0.18)
+    y0 = size_px + int(band_h * 0.16)
 
-    draw.text((x_pad, y), title.upper(), font=title_font, fill=text_color)
-    y += int(band_h * 0.42)
+    title_font = _load_font(int(band_h * 0.36))
+    sub_font = _load_font(int(band_h * 0.18))
+    meta_font = _load_font(int(band_h * 0.16))
+    attrib_font = _load_font(int(band_h * 0.13))
 
+    draw.text((x_pad, y0), title.upper(), font=title_font, fill=text_color)
+
+    y = y0 + int(band_h * 0.42)
     if subtitle:
         draw.text((x_pad, y), subtitle.upper(), font=sub_font, fill=sub_color)
-        y += int(band_h * 0.22)
 
-    coords = format_coords(lat, lon)
-    draw.text((x_pad, band_y0 + band_h - int(band_h * 0.28)), coords, font=coord_font, fill=sub_color)
+    coords = f"{lat:.5f}, {lon:.5f}"
+    draw.text((x_pad, size_px + band_h - int(band_h * 0.30)), coords, font=meta_font, fill=sub_color)
+
+    # attribution (as you requested)
+    attrib = "© OpenStreetMap contributors • MapTiler"
+    draw.text((x_pad, size_px + band_h - int(band_h * 0.14)), attrib, font=attrib_font, fill=sub_color)
 
     return canvas.convert("RGB")
 
 
-def parse_payload(payload: dict) -> Tuple[float, float, int, str, str, str, int]:
-    # Accept:
-    # - lat/lng (or lon)
-    # - address
-    # - zoom (tile zoom 0..19)
-    # - theme
-    # - size
-    lat = payload.get("lat")
-    lng = payload.get("lng")
-    lon = payload.get("lon")
+def parse_payload(payload: dict) -> Tuple[float, float, int, int, str, str, str]:
     address = payload.get("address")
+    lat = payload.get("lat")
+    lon = payload.get("lon") if payload.get("lon") is not None else payload.get("lng")
 
     zoom = payload.get("zoom", DEFAULT_ZOOM)
+    size_px = payload.get("size", DEFAULT_SIZE)
     theme = payload.get("theme", DEFAULT_THEME)
-    size_px = int(payload.get("size", DEFAULT_SIZE))
-
     title = payload.get("title", "")
     subtitle = payload.get("subtitle", "")
 
-    if lat is not None and (lng is not None or lon is not None):
+    if lat is not None and lon is not None:
         lat = float(lat)
-        lng = float(lng if lng is not None else lon)
+        lon = float(lon)
     elif address:
-        lat, lng = geocode_nominatim(str(address))
-        # be friendly to Nominatim
+        lat, lon = geocode_nominatim(str(address))
+        # be polite to Nominatim (avoid bursts)
         time.sleep(1.0)
     else:
-        raise ValueError("Provide either (lat + lng) OR address")
+        raise ValueError("Provide either address OR (lat + lon/lng)")
 
-    # zoom clamp
-    try:
-        zoom = int(float(zoom))
-    except Exception:
-        zoom = DEFAULT_ZOOM
-    zoom = max(0, min(19, zoom))
+    zoom = int(float(zoom))
+    size_px = int(float(size_px))
 
-    # size clamp (Render memory)
+    zoom = max(0, min(zoom, 20))
     size_px = max(512, min(size_px, 4096))
 
-    return lat, lng, zoom, str(title), str(subtitle), str(theme), size_px
+    return lat, lon, zoom, size_px, str(theme), str(title), str(subtitle)
 
 
-# ---------- Routes ----------
+# -------- Routes --------
 @app.get("/health")
 def health():
-    return "ok"
+    return f"ok {VERSION}"
 
 @app.post("/render")
 def render():
     payload = request.get_json(silent=True) or {}
     try:
-        lat, lng, zoom, title, subtitle, theme, size_px = parse_payload(payload)
-        img = compose_poster(
-            lat=lat,
-            lon=lng,
-            zoom=zoom,
-            title=title,
-            subtitle=subtitle,
-            theme=theme,
-            size_px=size_px,
-        )
+        lat, lon, zoom, size_px, theme, title, subtitle = parse_payload(payload)
+
+        map_img = fetch_map_maptiler(lat=lat, lon=lon, zoom=zoom, size_px=size_px)
+        map_img = apply_theme(map_img, theme)
+        poster = compose_poster(map_img, title, subtitle, lat, lon, theme)
 
         out = BytesIO()
-        img.save(out, format="PNG", optimize=True)
+        poster.save(out, format="PNG", optimize=True)
         out.seek(0)
 
-        filename = (title.strip() or "poster").replace(" ", "_")[:40]
+        safe_name = (title.strip() or "poster").replace(" ", "_")[:40]
         return send_file(
             out,
             mimetype="image/png",
             as_attachment=True,
-            download_name=f"{filename}.png",
+            download_name=f"{safe_name}.png",
         )
+
+    except requests.HTTPError as e:
+        # surface provider error nicely (403/401 etc.)
+        return jsonify({"error": f"Map provider error: {str(e)}"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
